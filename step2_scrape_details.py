@@ -33,8 +33,8 @@ import httpx
 from playwright.sync_api import sync_playwright
 
 from common.config import (
-    BASE_URL, OUTPUT_DIR, LINKS_FILE, DETAILS_CSV, DETAILS_JSON,
-    PROGRESS_FILE, PAGE_SIZE, BATCH_SIZE,
+    BASE_URL, LINKS_FILE, DETAILS_CSV, DETAILS_JSON,
+    PROGRESS_FILE, PROGRESS_SAVE_INTERVAL, DETAIL_RETRY,
     USER_AGENT, MAX_CONCURRENT, REQUEST_TIMEOUT,
 )
 from common.browser import (
@@ -50,20 +50,55 @@ from common.parser import parse_detail_html
 
 def load_progress() -> dict:
     """加载断点续传进度"""
+    default = {"completed": [], "failed": {}, "details": []}
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 自动去重 completed 列表（修复原版的重复问题）
-        data["completed"] = list(set(data.get("completed", [])))
-        return data
-    return {"completed": [], "details": []}
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  ⚠ 进度文件损坏或不可读，已忽略: {e}")
+            return default
+
+        completed = data.get("completed", [])
+        if not isinstance(completed, list):
+            completed = []
+        # 保序去重，避免 set 打乱顺序
+        completed = list(dict.fromkeys(completed))
+
+        failed = data.get("failed", {})
+        if not isinstance(failed, dict):
+            failed = {}
+
+        details = data.get("details", [])
+        if not isinstance(details, list):
+            details = []
+
+        return {
+            "completed": completed,
+            "failed": failed,
+            "details": details,
+        }
+    return default
 
 
 def save_progress(progress: dict):
-    """保存进度（自动去重 completed）"""
-    progress["completed"] = list(set(progress["completed"]))
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(progress, f, ensure_ascii=False, indent=2)
+    """原子保存进度，避免中断时写坏文件。"""
+    failed = progress.get("failed", {})
+    if not isinstance(failed, dict):
+        failed = {}
+    details = progress.get("details", [])
+    if not isinstance(details, list):
+        details = []
+
+    normalized = {
+        "completed": list(dict.fromkeys(progress.get("completed", []))),
+        "failed": failed,
+        "details": details,
+    }
+    tmp_file = f"{PROGRESS_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, PROGRESS_FILE)
 
 
 # ------------------------------------------------------------------
@@ -149,31 +184,76 @@ def acquire_cookies() -> dict:
 async def fetch_one(
     client: httpx.AsyncClient,
     url: str,
-    semaphore: asyncio.Semaphore,
-    retry: int = 2,
+    retry: int = DETAIL_RETRY,
 ) -> dict:
     """异步抓取单个详情页（带重试）"""
-    async with semaphore:
-        for attempt in range(retry + 1):
-            try:
-                resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-                if resp.status_code == 521:
-                    # JSL challenge — Cookie 可能已过期，无法在异步中恢复
-                    return {"错误": "Cookie 过期(521)"}
-                if resp.status_code != 200:
-                    if attempt < retry:
-                        await asyncio.sleep(1)
-                        continue
-                    return {"错误": f"HTTP {resp.status_code}"}
-                return parse_detail_html(resp.text)
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
+    for attempt in range(retry + 1):
+        try:
+            resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+            if resp.status_code == 521:
+                # JSL challenge — Cookie 可能已过期，无法在异步中恢复
+                return {"错误": "Cookie 过期(521)"}
+            if resp.status_code != 200:
                 if attempt < retry:
                     await asyncio.sleep(1)
                     continue
-                return {"错误": str(e)}
-            except Exception as e:
-                return {"错误": str(e)}
+                return {"错误": f"HTTP {resp.status_code}"}
+            return parse_detail_html(resp.text)
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt < retry:
+                await asyncio.sleep(1)
+                continue
+            return {"错误": str(e)}
+        except Exception as e:
+            return {"错误": str(e)}
     return {"错误": "未知错误"}
+
+
+def sort_details(details: list[dict]) -> list[dict]:
+    """按序号排序，确保输出顺序稳定。"""
+    return sorted(details, key=lambda x: x.get("序号", 10**9))
+
+
+def apply_scrape_result(
+    orig_idx: int,
+    record: dict,
+    detail: dict,
+    all_details: list[dict],
+    detail_index: dict,
+    completed_ids: set,
+    progress: dict,
+) -> bool:
+    """合并单条抓取结果，返回是否失败。"""
+    progress.setdefault("completed", [])
+    progress.setdefault("failed", {})
+    rid = record["记录ID"]
+    has_error = "错误" in detail
+
+    if has_error:
+        progress["failed"][rid] = detail.get("错误", "未知错误")
+        return True
+
+    merged = {
+        "序号": orig_idx + 1,
+        "标题": record["标题"],
+        "发布日期": record["发布日期"],
+        "业务类型": record["业务类型"],
+        "区域": record["区域"],
+        "详情链接": record["详情链接"],
+    }
+    merged.update(detail)
+
+    key = record["详情链接"] or rid
+    if key in detail_index:
+        all_details[detail_index[key]] = merged
+    else:
+        detail_index[key] = len(all_details)
+        all_details.append(merged)
+
+    completed_ids.add(rid)
+    progress["completed"].append(rid)
+    progress["failed"].pop(rid, None)
+    return False
 
 
 async def scrape_batch(
@@ -183,8 +263,7 @@ async def scrape_batch(
     completed_ids: set,
     progress: dict,
 ) -> int:
-    """异步批量抓取，按批保存进度"""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    """异步抓取，解耦并发上限与进度保存频率。"""
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -194,49 +273,58 @@ async def scrape_batch(
     total = len(pending)
     processed = 0
     errors = 0
+    save_interval = max(PROGRESS_SAVE_INTERVAL, 1)
+    detail_index = {
+        (d.get("详情链接") or f"idx:{i}"): i for i, d in enumerate(all_details)
+    }
+    queue: asyncio.Queue[tuple[int, dict]] = asyncio.Queue()
+    for item in pending:
+        queue.put_nowait(item)
 
     async with httpx.AsyncClient(cookies=cookies, headers=headers) as client:
-        # 按 BATCH_SIZE 分批处理
-        for batch_start in range(0, total, BATCH_SIZE):
-            batch = pending[batch_start : batch_start + BATCH_SIZE]
+        async def worker():
+            nonlocal processed, errors
+            while True:
+                try:
+                    orig_idx, record = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
 
-            # 并发抓取整批
-            tasks = [fetch_one(client, record["详情链接"], semaphore) for _, record in batch]
-            results = await asyncio.gather(*tasks)
+                try:
+                    detail = await fetch_one(client, record["详情链接"])
+                    has_error = apply_scrape_result(
+                        orig_idx,
+                        record,
+                        detail,
+                        all_details,
+                        detail_index,
+                        completed_ids,
+                        progress,
+                    )
+                    processed += 1
+                    if has_error:
+                        errors += 1
 
-            # 处理结果
-            for (orig_idx, record), detail in zip(batch, results):
-                rid = record["记录ID"]
-                processed += 1
+                    title = record["标题"][:40]
+                    status = "❌" if has_error else "✅"
+                    keys = [k for k in detail if k not in ("正文内容", "错误")]
+                    info = detail.get("错误", f"{len(keys)} 个字段")
+                    print(f"  [{processed}/{total}] {status} {title}... ({info})")
 
-                merged = {
-                    "序号": orig_idx + 1,  # 修复：使用原始索引
-                    "标题": record["标题"],
-                    "发布日期": record["发布日期"],
-                    "业务类型": record["业务类型"],
-                    "区域": record["区域"],
-                    "详情链接": record["详情链接"],
-                }
-                merged.update(detail)
-                all_details.append(merged)
-                completed_ids.add(rid)
-                progress["completed"].append(rid)
+                    if processed % save_interval == 0 or processed == total:
+                        progress["details"] = sort_details(all_details)
+                        save_progress(progress)
+                        pct = processed / total * 100
+                        print(f"  💾 进度 {pct:.0f}% ({len(completed_ids)} 条完成)")
+                finally:
+                    queue.task_done()
 
-                has_error = "错误" in detail
-                if has_error:
-                    errors += 1
-
-                title = record["标题"][:40]
-                status = "❌" if has_error else "✅"
-                keys = [k for k in detail if k not in ("正文内容", "错误")]
-                info = detail.get("错误", f"{len(keys)} 个字段")
-                print(f"  [{processed}/{total}] {status} {title}... ({info})")
-
-            # 每批保存一次进度
-            progress["details"] = all_details
-            save_progress(progress)
-            pct = processed / total * 100
-            print(f"  💾 进度 {pct:.0f}% ({len(completed_ids)} 条完成)")
+        worker_count = max(1, min(MAX_CONCURRENT, total))
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await queue.join()
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
     return errors
 
@@ -261,15 +349,17 @@ def main():
     # 加载进度（断点续传）
     progress = load_progress()
     completed_ids = set(progress["completed"])
-    all_details = progress["details"]
+    all_details = sort_details(progress["details"])
     print(f"📊 已完成: {len(completed_ids)} 条")
+    if progress["failed"]:
+        print(f"⚠ 历史失败: {len(progress['failed'])} 条（本次会继续重试）")
 
     pending = [(i, r) for i, r in enumerate(records) if r["记录ID"] not in completed_ids]
     print(f"⏳ 待处理: {len(pending)} 条")
 
     if not pending:
         print("✅ 全部已完成!")
-        save_csv(all_details)
+        save_csv(sort_details(all_details))
         return
 
     # 获取 Cookie
@@ -287,6 +377,7 @@ def main():
     elapsed = time.time() - start_time
 
     # 最终保存
+    all_details = sort_details(all_details)
     progress["details"] = all_details
     save_progress(progress)
 
@@ -309,7 +400,9 @@ def main():
     print(f"✅ 第二步完成! 共 {len(all_details)} 条详情")
     print(f"⏱  耗时: {elapsed:.1f}s | 平均: {elapsed / max(len(pending), 1):.2f}s/条")
     if errors:
-        print(f"⚠  {errors} 条抓取失败（可重新运行自动重试）")
+        print(f"⚠  本轮失败 {errors} 条（可重新运行自动重试）")
+    if progress["failed"]:
+        print(f"⚠  累计待重试 {len(progress['failed'])} 条")
     print(f"{'=' * 60}")
 
 

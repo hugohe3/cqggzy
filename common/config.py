@@ -26,7 +26,10 @@ DEFAULT_BIZ_TYPE = ""
 DEFAULT_INFO_TYPE = "交易结果"
 DEFAULT_TIME_PERIOD = "近三月"
 PAGE_SIZE = 20
-BATCH_SIZE = 10  # 每批保存一次进度
+PROGRESS_SAVE_INTERVAL = 10  # 每处理 N 条保存一次进度
+BATCH_SIZE = PROGRESS_SAVE_INTERVAL  # 兼容旧配置名
+MAX_PAGE_RETRIES = 3  # step1 单页失败最大重试次数
+DETAIL_RETRY = 2  # step2 单详情失败最大重试次数
 
 # ==================== 浏览器 ====================
 USER_AGENT = (
@@ -34,6 +37,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "0").lower() in ("1", "true", "yes")
 
 # ==================== HTTP 并发 ====================
 MAX_CONCURRENT = 10   # 异步并发数

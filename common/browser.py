@@ -9,9 +9,13 @@ import json
 import os
 import time
 
-from playwright.sync_api import sync_playwright
-
-from .config import PAGE_URL, COOKIES_FILE, USER_AGENT, OUTPUT_DIR
+from .config import (
+    PAGE_URL,
+    COOKIES_FILE,
+    USER_AGENT,
+    OUTPUT_DIR,
+    PLAYWRIGHT_HEADLESS,
+)
 
 
 # ------------------------------------------------------------------
@@ -42,7 +46,7 @@ def pass_jsl(page) -> bool:
 def create_browser_context(playwright):
     """创建统一配置的浏览器 context"""
     browser = playwright.chromium.launch(
-        headless=False,
+        headless=PLAYWRIGHT_HEADLESS,
         args=["--disable-blink-features=AutomationControlled"],
     )
     context = browser.new_context(

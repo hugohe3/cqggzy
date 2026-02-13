@@ -30,10 +30,31 @@ def parse_api_records(api_data: dict) -> tuple[list[dict], int]:
 
     content = api_data.get("content", "")
     if isinstance(content, str):
-        content = json.loads(content)
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"  ❌ API content JSON 解析失败: {e}")
+            return [], 0
+
+    if not isinstance(content, dict):
+        print(f"  ❌ API content 类型异常: {type(content).__name__}")
+        return [], 0
 
     result = content.get("result", {})
-    return result.get("records", []), result.get("totalcount", 0)
+    if not isinstance(result, dict):
+        return [], 0
+
+    records = result.get("records", [])
+    if not isinstance(records, list):
+        records = []
+
+    total = result.get("totalcount", 0)
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = len(records)
+
+    return records, total
 
 
 def clean_record(record: dict) -> dict:

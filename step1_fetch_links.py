@@ -39,13 +39,26 @@ from common.config import (
     API_URL, PAGE_URL, OUTPUT_DIR, LINKS_FILE,
     DEFAULT_KEYWORD, DEFAULT_REGION, DEFAULT_BIZ_TYPE,
     DEFAULT_INFO_TYPE, DEFAULT_TIME_PERIOD,
-    PAGE_SIZE, USER_AGENT, REQUEST_TIMEOUT,
+    PAGE_SIZE, USER_AGENT, REQUEST_TIMEOUT, MAX_PAGE_RETRIES,
 )
 from common.browser import (
     pass_jsl, create_browser_context,
     extract_cookies, save_cookies, smart_click,
 )
 from common.parser import parse_api_records, clean_record
+
+
+def extract_request_body(response) -> dict | None:
+    """从 Playwright 响应对象中提取 POST JSON 请求体。"""
+    if response.request.method != "POST":
+        return None
+    raw = response.request.post_data
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 def main():
@@ -95,10 +108,9 @@ def main():
         def on_response(response):
             nonlocal captured_body
             if API_URL in response.url:
-                try:
-                    captured_body = json.loads(response.request.post_data)
-                except Exception:
-                    pass
+                parsed = extract_request_body(response)
+                if parsed:
+                    captured_body = parsed
 
         page.on("response", on_response)
 
@@ -113,18 +125,40 @@ def main():
         if biz_type:
             smart_click(page, biz_type)
 
-        # 4) 输入关键词搜索
+        # 4) 输入关键词搜索，并显式等待目标 API 响应
         try:
             inp = page.locator("input#search, input.input-box").first
             inp.clear()
             inp.fill(keyword)
-            inp.press("Enter")
-            time.sleep(3)
-            print(f"  ✅ 已搜索: {keyword}")
+            try:
+                with page.expect_response(
+                    lambda r: API_URL in r.url and r.request.method == "POST",
+                    timeout=15000,
+                ) as resp_info:
+                    inp.press("Enter")
+                parsed = extract_request_body(resp_info.value)
+                if parsed:
+                    captured_body = parsed
+                print(f"  ✅ 已搜索: {keyword}")
+            except Exception:
+                # 兜底：如果 expect_response 超时，继续依赖被动拦截结果
+                inp.press("Enter")
+                print(f"  ⚠ 搜索已触发，但未在超时时间内捕获到响应: {keyword}")
         except Exception:
             print("  ⚠ 搜索框未找到")
 
-        time.sleep(2)
+        # 搜索框不可用时，尝试再主动等待一次响应，减少时序竞态
+        if not captured_body:
+            try:
+                resp = page.wait_for_response(
+                    lambda r: API_URL in r.url and r.request.method == "POST",
+                    timeout=8000,
+                )
+                parsed = extract_request_body(resp)
+                if parsed:
+                    captured_body = parsed
+            except Exception:
+                pass
 
         if not captured_body:
             print("  ❌ 未能拦截到 API 请求体，请检查网络")
@@ -165,19 +199,36 @@ def main():
         total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
         print(f"  ✅ 总计 {total} 条, {total_pages} 页")
 
-        # 翻页
+        # 翻页（单页失败重试，失败页跳过并继续后续页）
+        failed_pages = []
         for pn in range(1, total_pages):
             captured_body["pn"] = pn
-            try:
-                resp = client.post(API_URL, json=captured_body)
-                recs, _ = parse_api_records(resp.json())
-                all_records.extend(recs)
-                if (pn + 1) % 10 == 0 or pn == total_pages - 1:
-                    print(f"    {pn + 1}/{total_pages} 页 (累计 {len(all_records)} 条)")
-            except Exception as ex:
-                print(f"    ❌ 第{pn + 1}页: {ex}")
-                break
+            ok = False
+            for attempt in range(1, MAX_PAGE_RETRIES + 1):
+                try:
+                    resp = client.post(API_URL, json=captured_body)
+                    recs, _ = parse_api_records(resp.json())
+                    all_records.extend(recs)
+                    ok = True
+                    break
+                except Exception as ex:
+                    if attempt < MAX_PAGE_RETRIES:
+                        wait = 0.2 * attempt
+                        print(f"    ⚠ 第{pn + 1}页失败(第{attempt}次): {ex}，{wait:.1f}s 后重试")
+                        time.sleep(wait)
+                    else:
+                        print(f"    ❌ 第{pn + 1}页最终失败: {ex}")
+            if not ok:
+                failed_pages.append(pn + 1)
+                continue
+            if (pn + 1) % 10 == 0 or pn == total_pages - 1:
+                print(f"    {pn + 1}/{total_pages} 页 (累计 {len(all_records)} 条)")
             time.sleep(0.1)  # 轻量间隔，HTTP 无需长等待
+
+        if failed_pages:
+            preview = ", ".join(str(x) for x in failed_pages[:10])
+            more = "..." if len(failed_pages) > 10 else ""
+            print(f"  ⚠ 跳过失败页 {len(failed_pages)} 个: {preview}{more}")
 
     # ===================================================================
     #  保存结果
